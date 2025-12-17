@@ -2,279 +2,258 @@
 import socket
 import struct
 import time
-import csv
 import argparse
-from collections import deque
-import pandas as pd
 import os
+import csv
+from collections import deque
 
+# ======================
 # Protocol constants
-MAGIC = 0x54  # note: use 0x54 (decimal 84)
+# ======================
+MAGIC = 0x54  # 'T'
 MT_INIT = 0x0
 MT_INIT_ACK = 0x1
 MT_DATA = 0x2
 MT_HEARTBEAT = 0x3
 MT_ACK = 0x4
 
-HEADER_FMT = "!BBHII"  # magic(1), ver_type(1), device_id(2), seq(4), ts(4)
-HEADER_SIZE = struct.calcsize(HEADER_FMT)  # should be 12
+HEADER_FMT = "!BBHII"   # magic(1), ver_type(1), device_id(2), seq(4), ts(4)
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12
 
-# reorder and buffer settings
-REORDER_WINDOW = 1.0  # seconds to wait before flushing based on sensor timestamp
-REORDER_BUFFER_MAX = 64
-OFFLINE_TIMEOUT = 5.0  # seconds after which device considered offline (heartbeat missing)
+# ======================
+# Collector behavior
+# ======================
+REORDER_WINDOW_SEC = 1.0     # reorder wait window based on sender timestamp
+REORDER_BUFFER_MAX = 256     # safety cap
+OFFLINE_TIMEOUT_SEC = 5.0    # if no packets/heartbeats for X sec => offline
+SEEN_WINDOW = 10000          # how many seqs we remember per device to detect duplicates
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--host", default="0.0.0.0")
-parser.add_argument("--port", type=int, default=9999)
-parser.add_argument("--csv", default="telemetry_log.csv")
-parser.add_argument("--send-ack", action="store_true", help="(debug) send MT_ACK for received DATA/HEARTBEAT")
-parser.add_argument("--seen-window", type=int, default=4096, help="max seq numbers kept per device for duplicate detection")
-args = parser.parse_args()
+CSV_FIELDS = ["device_id", "seq", "timestamp", "arrival_time", "duplicate_flag", "gap_flag"]
 
-# per-device state
-devices = {}
-
-# prepare CSV
-csv_fields = ["device_id", "seq", "timestamp", "arrival_time", "duplicate_flag", "gap_flag"]
-os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
-if not os.path.exists(args.csv):
-    pd.DataFrame(columns=csv_fields).to_csv(args.csv, index=False)
-
-RUN_START = time.time()
-
-def now_rel_seconds():
-    return time.time() - RUN_START
-
-def parse_header(packet):
+# ======================
+# Helpers
+# ======================
+def unpack_header(packet: bytes):
     if len(packet) < HEADER_SIZE:
-        raise ValueError("Short header")
+        raise ValueError("Packet too short")
     magic, ver_type, device_id, seq, ts = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
     version = ver_type >> 4
     msg_type = ver_type & 0x0F
     return magic, version, msg_type, device_id, seq, ts
 
-def send_init_ack(sock, addr, device_id, seq):
-    ver_type = (1 << 4) | MT_INIT_ACK
-    header = struct.pack(HEADER_FMT, MAGIC, ver_type, device_id, seq, int(now_rel_seconds()))
-    sock.sendto(header, addr)
+def pack_header(msg_type: int, device_id: int, seq: int, ts: int):
+    ver_type = (1 << 4) | (msg_type & 0x0F)
+    return struct.pack(HEADER_FMT, MAGIC, ver_type, device_id & 0xFFFF, seq & 0xFFFFFFFF, ts & 0xFFFFFFFF)
 
-def send_data_ack(sock, addr, device_id, seq):
-    ver_type = (1 << 4) | MT_ACK
-    header = struct.pack(HEADER_FMT, MAGIC, ver_type, device_id, seq, int(now_rel_seconds()))
-    sock.sendto(header, addr)
+class DeviceState:
+    def __init__(self):
+        self.reorder = []  # list of dicts: {seq, ts, arrival_time}
+        self.last_logged_seq = None  # last seq written to CSV (in reordered stream)
+        self.seen_set = set()
+        self.seen_queue = deque()
+        self.last_seen_wall = time.time()
+        self.dup_count = 0
+        self.gap_count = 0
 
-def process_data_row(device_id, seq, ts, arrival_time, duplicate_flag, gap_flag):
-    row = {
+    def seen_add(self, seq: int):
+        self.seen_set.add(seq)
+        self.seen_queue.append(seq)
+        while len(self.seen_queue) > SEEN_WINDOW:
+            old = self.seen_queue.popleft()
+            self.seen_set.discard(old)
+
+def ensure_csv(path: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            w.writeheader()
+
+def write_row(writer, file_handle, device_id, seq, ts, arrival_time, dup, gap):
+    writer.writerow({
         "device_id": device_id,
         "seq": seq,
         "timestamp": ts,
         "arrival_time": arrival_time,
-        "duplicate_flag": int(bool(duplicate_flag)),
-        "gap_flag": int(bool(gap_flag)),
-    }
-    pd.DataFrame([row]).to_csv(args.csv, mode="a", header=False, index=False)
+        "duplicate_flag": 1 if dup else 0,
+        "gap_flag": 1 if gap else 0,
+    })
+    # IMPORTANT: force it to actually write to disk
+    file_handle.flush()
 
-def flush_reorder_buffer(device_id, state, force=False, current_ts=None):
-    buffer = state['reorder_buffer']
-    if not buffer:
+def flush_device(state: DeviceState, writer, fhandle, *, current_ts=None, force=False):
+    """
+    Flush reorder buffer in sender-timestamp order.
+    Gap detection happens HERE (after reorder).
+    """
+    if not state.reorder:
         return
 
-    ordered = sorted(buffer, key=lambda item: (item['timestamp'], item['seq']))
-    state['reorder_buffer'] = deque(ordered)
+    # sort by (timestamp, seq) to approximate correct ordering
+    state.reorder.sort(key=lambda x: (x["ts"], x["seq"]))
 
-    while state['reorder_buffer']:
-        candidate = state['reorder_buffer'][0]
-        should_flush = force
-
-        if not should_flush and current_ts is not None:
-            if (current_ts - candidate['timestamp']) >= REORDER_WINDOW:
-                should_flush = True
-
-        if not should_flush and len(state['reorder_buffer']) > REORDER_BUFFER_MAX:
-            should_flush = True
-
-        if not should_flush:
-            break
-
-        entry = state['reorder_buffer'].popleft()
-
-        # compute gap in *timestamp order* (after reordering), not on arrival
-        gap = False
-        last_logged = state.get('last_logged_seq')
-        if last_logged is not None:
-            expected = (last_logged + 1) & 0xFFFFFFFF
-            if entry['seq'] != expected:
-                gap = True
-                state['gap_count'] = state.get('gap_count', 0) + 1
-        state['last_logged_seq'] = entry['seq']
-        process_data_row(
-            device_id,
-            entry['seq'],
-            entry['timestamp'],
-            entry['arrival_time'],
-            False,
-            gap,
-        )
-
-def handle_init(sock, addr, payload, device_id, seq, ts):
-    print(f"[INIT] from {device_id} seq={seq} ts={ts} addr={addr}")
-    devices.setdefault(device_id, {
-        'last_logged_seq': None,
-        'seen_seqs': set(),
-        'seen_queue': deque(),
-        'reorder_buffer': deque(),
-        'last_ts': None,
-        'dup_count': 0,
-        'gap_count': 0,
-        'last_seen': time.time()
-    })
-    devices[device_id]['last_seen'] = time.time()
-    send_init_ack(sock, addr, device_id, seq)
-
-def handle_data(sock, addr, device_id, seq, ts, payload):
-    arrival_time = int(now_rel_seconds())
-    st = devices.setdefault(device_id, {
-        'last_logged_seq': None,
-        'seen_seqs': set(),
-        'seen_queue': deque(),
-        'reorder_buffer': deque(),
-        'last_ts': None,
-        'dup_count': 0,
-        'gap_count': 0,
-        'last_seen': time.time()
-    })
-
-    # update last seen
-    st['last_seen'] = time.time()
-
-    # duplicate detection
-    if seq in st['seen_seqs']:
-        st['dup_count'] += 1
-        # log duplicate immediately
-        process_data_row(device_id, seq, ts, arrival_time, True, False)
-        print(f"[DUP] device={device_id} seq={seq} ts={ts}")
-        if args.send_ack:
-            send_data_ack(sock, addr, device_id, seq)
-        return
-
-    # best-effort payload parse (optional, not logged)
-    readings = []
+    # flush as many as allowed
     i = 0
-    while i + 6 <= len(payload):
-        sensor_id = payload[i]
-        fmt = payload[i+1]
-        if fmt == 0x01 and i + 6 <= len(payload):
-            val = struct.unpack("!f", payload[i+2:i+6])[0]
-            readings.append((sensor_id, val))
-            i += 6
-        elif fmt == 0x02 and i + 4 <= len(payload):
-            val = struct.unpack("!h", payload[i+2:i+4])[0]
-            readings.append((sensor_id, val))
-            i += 4
-        else:
+    while i < len(state.reorder):
+        entry = state.reorder[i]
+        can_flush = force
+
+        if not can_flush and current_ts is not None:
+            if (current_ts - entry["ts"]) >= REORDER_WINDOW_SEC:
+                can_flush = True
+
+        if not can_flush and len(state.reorder) > REORDER_BUFFER_MAX:
+            can_flush = True
+
+        if not can_flush:
             break
 
-    # NOTE: gap detection must be done AFTER reordering (in flush_reorder_buffer).
-    # Here we only track duplicates and buffer the packet for timestamp-based ordering.
-    st['seen_seqs'].add(seq)
-    st.setdefault('seen_queue', deque()).append(seq)
-    # prune duplicate-tracking window to avoid unbounded growth
-    while len(st['seen_queue']) > args.seen_window:
-        old = st['seen_queue'].popleft()
-        st['seen_seqs'].discard(old)
-    st['last_ts'] = ts
+        # pop earliest
+        entry = state.reorder.pop(i)
 
-    st['reorder_buffer'].append({
-        'seq': seq,
-        'timestamp': ts,
-        'arrival_time': arrival_time,
-    })
-    flush_reorder_buffer(device_id, st, current_ts=ts)
+        # gap detection based on *last_logged_seq*
+        gap = False
+        if state.last_logged_seq is not None:
+            expected = (state.last_logged_seq + 1) & 0xFFFFFFFF
+            if entry["seq"] != expected:
+                gap = True
+                state.gap_count += 1
 
-    # optional ACK (OFF by default)
-    if args.send_ack:
-        send_data_ack(sock, addr, device_id, seq)
+        state.last_logged_seq = entry["seq"]
+        write_row(writer, fhandle,
+                  entry["device_id"], entry["seq"], entry["ts"], entry["arrival_time"],
+                  dup=False, gap=gap)
 
-    print(f"[DATA] device={device_id} seq={seq} ts={ts} dup=False queued=True readings={len(readings)}")
+    # done
 
-def handle_heartbeat(sock, addr, device_id, seq, ts):
-    arrival_time = int(now_rel_seconds())
-    st = devices.setdefault(device_id, {
-        'last_logged_seq': None,
-        'seen_seqs': set(),
-        'seen_queue': deque(),
-        'reorder_buffer': deque(),
-        'last_ts': None,
-        'dup_count': 0,
-        'gap_count': 0,
-        'last_seen': time.time()
-    })
-
-    st['last_seen'] = time.time()
-
-    # duplicate detection (heartbeats can also duplicate)
-    if seq in st['seen_seqs']:
-        st['dup_count'] += 1
-        process_data_row(device_id, seq, ts, arrival_time, True, False)
-        print(f"[DUP-HB] device={device_id} seq={seq} ts={ts}")
-        if args.send_ack:
-            send_data_ack(sock, addr, device_id, seq)
-        return
-
-    st['seen_seqs'].add(seq)
-    st.setdefault('seen_queue', deque()).append(seq)
-    while len(st['seen_queue']) > args.seen_window:
-        old = st['seen_queue'].popleft()
-        st['seen_seqs'].discard(old)
-
-    # buffer heartbeat and force-flush so ordering is by sensor timestamp
-    st['reorder_buffer'].append({
-        'seq': seq,
-        'timestamp': ts,
-        'arrival_time': arrival_time,
-    })
-    flush_reorder_buffer(device_id, st, force=True, current_ts=ts)
-    print(f"[HEARTBEAT] device={device_id} seq={seq} ts={ts}")
-
-def mark_offline_devices():
-    now_t = time.time()
-    for d, st in devices.items():
-        last = st.get('last_seen', 0)
-        if (now_t - last) > OFFLINE_TIMEOUT:
-            print(f"[OFFLINE] device={d} last_seen={(now_t - last):.1f}s ago")
-
+def mark_offline(devices: dict):
+    now = time.time()
+    for dev_id, st in devices.items():
+        if (now - st.last_seen_wall) > OFFLINE_TIMEOUT_SEC:
+            print(f"[OFFLINE] device={dev_id} last_seen={(now - st.last_seen_wall):.1f}s ago")
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=9999)
+    ap.add_argument("--csv", default="telemetry_log.csv")
+    ap.add_argument("--send-ack", action="store_true", help="debug only (NOT recommended for Phase2)")
+    args = ap.parse_args()
+
+    ensure_csv(args.csv)
+
+    # open CSV ONCE, append mode
+    f = open(args.csv, "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.host, args.port))
     sock.settimeout(1.0)
-    print(f"Collector listening on {args.host}:{args.port} (csv={args.csv})")
+
+    devices = {}  # device_id -> DeviceState
+
+    print(f"Collector listening on {args.host}:{args.port}")
+    print(f"Logging to: {args.csv}")
 
     try:
         while True:
             try:
-                data, addr = sock.recvfrom(4096)
+                packet, addr = sock.recvfrom(4096)
             except socket.timeout:
-                mark_offline_devices()
-                continue
-            except Exception as e:
-                print("Recv error:", e)
+                # periodic offline reporting
+                mark_offline(devices)
                 continue
 
             try:
-                magic, version, msg_type, device_id, seq, ts = parse_header(data)
+                magic, version, msg_type, device_id, seq, ts = unpack_header(packet)
             except Exception as e:
-                print("Malformed packet from", addr, e)
+                print("[DROP] bad packet:", e)
                 continue
 
             if magic != MAGIC:
-                print("Invalid magic from", addr)
+                print("[DROP] bad magic")
                 continue
 
-            payload = data[HEADER_SIZE:]
+            arrival_time = int(time.time())  # absolute seconds (fine), or switch to relative if you want
 
+            st = devices.get(device_id)
+            if st is None:
+                st = DeviceState()
+                devices[device_id] = st
+
+            st.last_seen_wall = time.time()
+
+            # INIT: reply INIT_ACK
             if msg_type == MT_INIT:
-                handle_init(sock, addr, payload, device_id, seq, ts)
-            elif msg_type == MT_DATA:
-                handle_data(sock, addr, device_id, seq, ts, payload)
-            el
+                print(f"[INIT] device={device_id} seq={seq} ts={ts} from={addr}")
+                init_ack = pack_header(MT_INIT_ACK, device_id, seq, ts)
+                sock.sendto(init_ack, addr)
+                continue
+
+            # Optional ACK support (OFF by default)
+            if args.send_ack and msg_type in (MT_DATA, MT_HEARTBEAT):
+                ack = pack_header(MT_ACK, device_id, seq, ts)
+                sock.sendto(ack, addr)
+
+            # Duplicate detection (log duplicates immediately)
+            if seq in st.seen_set:
+                st.dup_count += 1
+                write_row(writer, f, device_id, seq, ts, arrival_time, dup=True, gap=False)
+                if msg_type == MT_HEARTBEAT:
+                    print(f"[DUP-HB] device={device_id} seq={seq} ts={ts}")
+                else:
+                    print(f"[DUP] device={device_id} seq={seq} ts={ts}")
+                continue
+
+            st.seen_add(seq)
+
+            # DATA / HEARTBEAT handling:
+            if msg_type == MT_DATA:
+                # buffer for reorder; do NOT do gap checks here
+                st.reorder.append({
+                    "device_id": device_id,
+                    "seq": seq,
+                    "ts": ts,
+                    "arrival_time": arrival_time
+                })
+                flush_device(st, writer, f, current_ts=ts, force=False)
+                print(f"[DATA] device={device_id} seq={seq} ts={ts} buffered={len(st.reorder)}")
+
+            elif msg_type == MT_HEARTBEAT:
+                # heartbeats also go through reorder pipeline; we can force flush if you want
+                st.reorder.append({
+                    "device_id": device_id,
+                    "seq": seq,
+                    "ts": ts,
+                    "arrival_time": arrival_time
+                })
+                flush_device(st, writer, f, current_ts=ts, force=True)
+                print(f"[HB] device={device_id} seq={seq} ts={ts}")
+
+            else:
+                print(f"[INFO] unknown/ignored msg_type={msg_type} device={device_id} seq={seq}")
+
+    except KeyboardInterrupt:
+        print("\nShutting down... flushing buffers")
+
+        # Force flush ALL reorder buffers on exit
+        for dev_id, st in devices.items():
+            flush_device(st, writer, f, current_ts=10**9, force=True)
+
+        print("Done.")
+
+    finally:
+        try:
+            f.flush()
+        except:
+            pass
+        try:
+            f.close()
+        except:
+            pass
+        try:
+            sock.close()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
