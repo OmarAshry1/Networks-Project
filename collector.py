@@ -1,71 +1,70 @@
+#!/usr/bin/env python3
 import socket
 import struct
 import time
 import csv
 import argparse
-from collections import defaultdict, deque
+from collections import deque
 import pandas as pd
+import os
 
-# shewayet protocol constants
-# n3mel identify lel packets that belong to protocol - 
-# 3ashan UDP byb2a unreliable we momken ysend random garbage packets we ehna 3ayzeen n3mel record lel packets eli leh 3alaka bel protocol 
-MAGIC = 0x054 # hn2ool law el magic != 0x54 nrfod el packet deh
+# Protocol constants
+MAGIC = 0x54  # note: use 0x54 (decimal 84)
+MT_INIT = 0x0
+MT_INIT_ACK = 0x1
+MT_DATA = 0x2
+MT_HEARTBEAT = 0x3
+MT_ACK = 0x4
 
-# types lel messages 
-MT_INIT = 0x0 # by3mel initialize lel handshake so that collector create or refresh state abl data arriving
-MT_INIT_ACK = 0x1 #confirms to the sensor en el handshake is successful
-MT_DATA = 0x2 # data packet from sensor
-MT_HEARTBEAT = 0x3 # heartbeat packet from sensor to keep connection alive - prevents timeout
+HEADER_FMT = "!BBHII"  # magic(1), ver_type(1), device_id(2), seq(4), ts(4)
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # should be 12
 
-# header eli homa 12 bytes
-HEADER_FMT = "!BBHII"  # 1+1+2+4+4 = 12 bytes - magic(1) + version + type (1) + device_id(2) + sequence(4) + timestamp(4)
-HEADER_SIZE = 12
-REORDER_WINDOW = 1.0  # seconds of slack before we flush buffered packets
+# reorder and buffer settings
+REORDER_WINDOW = 1.0  # seconds to wait before flushing based on sensor timestamp
 REORDER_BUFFER_MAX = 64
+OFFLINE_TIMEOUT = 5.0  # seconds after which device considered offline (heartbeat missing)
 
-def parse_header(packet):
-    if len(packet) < HEADER_SIZE: # law el packet size < 12 bytes n3ml error
-        raise ValueError("Short header")
-    magic , ver_type ,device_id , seq , ts = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE] )
-    version = ver_type >> 4 ## ver_type bytb3t 8 bits 0->3  byb2o version w 4->7 byb2o type  , fa hena 3amalna shift 4 bits 3ashan ngeb el version
-    msg_type = ver_type & 0x0F ## w hena 3amalna and 0x0F 3ashan ngeb el type (masking)
-    return magic, version, msg_type, device_id, seq, ts
+parser = argparse.ArgumentParser()
+parser.add_argument("--host", default="0.0.0.0")
+parser.add_argument("--port", type=int, default=9999)
+parser.add_argument("--csv", default="telemetry_log.csv")
+parser.add_argument("--send-ack", action="store_true", help="(debug) send MT_ACK for received DATA/HEARTBEAT")
+parser.add_argument("--seen-window", type=int, default=4096, help="max seq numbers kept per device for duplicate detection")
+args = parser.parse_args()
 
-
-# lel demo 3ashan n3mel kaza configuration , change el parameters lama n3mel run 
-parser = argparse.ArgumentParser() # standard fe python 3ashan 3ashan n3mel command-line options
-parser.add_argument("--host", default="0.0.0.0") # collector listens to all network ports/interfaces ela law 3amalna confiig
-parser.add_argument("--port", type=int, default=9999) # accepts integres and dafaults to 9999 to let switch port easily
-parser.add_argument("--csv", default="telemetry_log.csv") # choose where to store data csv 
-args = parser.parse_args() # 
-
-#state le kol device 
+# per-device state
 devices = {}
 
-columns = ["device_id", "seq", "timestamp", "arrival_time", "duplicate_flag", "gap_flag"]
-df = pd.DataFrame(columns=columns)
-df.to_csv(args.csv, index=False)
+# prepare CSV
+csv_fields = ["device_id", "seq", "timestamp", "arrival_time", "duplicate_flag", "gap_flag"]
+os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
+if not os.path.exists(args.csv):
+    pd.DataFrame(columns=csv_fields).to_csv(args.csv, index=False)
 
-RUN_START = time.time() # i want to log everything relative to when the collector booted
+RUN_START = time.time()
 
-def handle_init(sock, addr, payload, device_id, seq, ts):
-    print(f"from {device_id} seq={seq} ts={ts} addr={addr}") # for the demo , creates log for troubleshooting
-    
+def now_rel_seconds():
+    return time.time() - RUN_START
+
+def parse_header(packet):
+    if len(packet) < HEADER_SIZE:
+        raise ValueError("Short header")
+    magic, ver_type, device_id, seq, ts = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
+    version = ver_type >> 4
+    msg_type = ver_type & 0x0F
+    return magic, version, msg_type, device_id, seq, ts
+
+def send_init_ack(sock, addr, device_id, seq):
     ver_type = (1 << 4) | MT_INIT_ACK
-    header = struct.pack("!BBHII", MAGIC, ver_type, device_id, seq, int(time.time() - RUN_START)) # pack the header with the magic, version, device_id, sequence, and timestamp
-    sock.sendto(header, addr) # send the header back to the sensor, 3ashan tb2a 3arfa el collector is ready to receive data
-    # record le kol device state eli b3mel initialize lel handshake , makes sure its reset every time
-    devices.setdefault(device_id, {
-        'last_seq': None, # the most recent sequence number processed 
-        'seen_seqs': set(), # 
-        'reorder_buffer': deque(), #a queue for packets that are out of order, to be reordered
-        'last_ts': None, # the most recent timestamp processed
-        'dup_count': 0, # number of duplicate packets
-        'gap_count': 0 # number of gap packets
-    })
+    header = struct.pack(HEADER_FMT, MAGIC, ver_type, device_id, seq, int(now_rel_seconds()))
+    sock.sendto(header, addr)
 
-## n3mel csv be pandas
-def process_data(device_id, seq, ts, arrival_time, duplicate_flag, gap_flag):
+def send_data_ack(sock, addr, device_id, seq):
+    ver_type = (1 << 4) | MT_ACK
+    header = struct.pack(HEADER_FMT, MAGIC, ver_type, device_id, seq, int(now_rel_seconds()))
+    sock.sendto(header, addr)
+
+def process_data_row(device_id, seq, ts, arrival_time, duplicate_flag, gap_flag):
     row = {
         "device_id": device_id,
         "seq": seq,
@@ -99,102 +98,183 @@ def flush_reorder_buffer(device_id, state, force=False, current_ts=None):
             break
 
         entry = state['reorder_buffer'].popleft()
-        process_data(
+
+        # compute gap in *timestamp order* (after reordering), not on arrival
+        gap = False
+        last_logged = state.get('last_logged_seq')
+        if last_logged is not None:
+            expected = (last_logged + 1) & 0xFFFFFFFF
+            if entry['seq'] != expected:
+                gap = True
+                state['gap_count'] = state.get('gap_count', 0) + 1
+        state['last_logged_seq'] = entry['seq']
+        process_data_row(
             device_id,
             entry['seq'],
             entry['timestamp'],
             entry['arrival_time'],
             False,
-            entry['gap'],
+            gap,
         )
 
-## handle le data packets
-def handle_data(device_id, seq, ts, payload):
-    arrival_time = int(time.time() - RUN_START) # seconds since collector started
-    st = devices.setdefault(device_id, {
-        'last_seq': None,
+def handle_init(sock, addr, payload, device_id, seq, ts):
+    print(f"[INIT] from {device_id} seq={seq} ts={ts} addr={addr}")
+    devices.setdefault(device_id, {
+        'last_logged_seq': None,
         'seen_seqs': set(),
+        'seen_queue': deque(),
         'reorder_buffer': deque(),
         'last_ts': None,
         'dup_count': 0,
-        'gap_count': 0
+        'gap_count': 0,
+        'last_seen': time.time()
+    })
+    devices[device_id]['last_seen'] = time.time()
+    send_init_ack(sock, addr, device_id, seq)
+
+def handle_data(sock, addr, device_id, seq, ts, payload):
+    arrival_time = int(now_rel_seconds())
+    st = devices.setdefault(device_id, {
+        'last_logged_seq': None,
+        'seen_seqs': set(),
+        'seen_queue': deque(),
+        'reorder_buffer': deque(),
+        'last_ts': None,
+        'dup_count': 0,
+        'gap_count': 0,
+        'last_seen': time.time()
     })
 
+    # update last seen
+    st['last_seen'] = time.time()
+
+    # duplicate detection
     if seq in st['seen_seqs']:
         st['dup_count'] += 1
-        process_data(device_id, seq, ts, arrival_time, True, False)
-        print(f"device={device_id} seq={seq} ts={ts} dup=True gap=False readings=0") # duplicate packet logged
+        # log duplicate immediately
+        process_data_row(device_id, seq, ts, arrival_time, True, False)
+        print(f"[DUP] device={device_id} seq={seq} ts={ts}")
+        if args.send_ack:
+            send_data_ack(sock, addr, device_id, seq)
         return
 
-    gap = False
-    if st['last_seq'] is not None and seq != ((st['last_seq'] + 1) & 0xFFFFFFFF):
-        gap = True
-        st['gap_count'] += 1
-
-    st['seen_seqs'].add(seq)
-    st['last_seq'] = seq
-    st['last_ts'] = ts
-
-    # parse payload: sequence of readings. Each reading: sensor_id(1), format(1), value(float32)
-    readings = [] # list to store the readings
+    # best-effort payload parse (optional, not logged)
+    readings = []
     i = 0
     while i + 6 <= len(payload):
-        sensor_id = payload[i] # get the sensor id
-        fmt = payload[i+1] # get the format
-        if fmt == 0x01:  # float32
-            val = struct.unpack("!f", payload[i+2:i+6])[0] # unpack the value
+        sensor_id = payload[i]
+        fmt = payload[i+1]
+        if fmt == 0x01 and i + 6 <= len(payload):
+            val = struct.unpack("!f", payload[i+2:i+6])[0]
             readings.append((sensor_id, val))
             i += 6
-        elif fmt == 0x02:  # int16
-            val = struct.unpack("!h", payload[i+2:i+4])[0] # unpack the value
+        elif fmt == 0x02 and i + 4 <= len(payload):
+            val = struct.unpack("!h", payload[i+2:i+4])[0]
             readings.append((sensor_id, val))
             i += 4
         else:
-            # unknown format -> stop
-            break # stop the loop
+            break
+
+    # NOTE: gap detection must be done AFTER reordering (in flush_reorder_buffer).
+    # Here we only track duplicates and buffer the packet for timestamp-based ordering.
+    st['seen_seqs'].add(seq)
+    st.setdefault('seen_queue', deque()).append(seq)
+    # prune duplicate-tracking window to avoid unbounded growth
+    while len(st['seen_queue']) > args.seen_window:
+        old = st['seen_queue'].popleft()
+        st['seen_seqs'].discard(old)
+    st['last_ts'] = ts
 
     st['reorder_buffer'].append({
         'seq': seq,
         'timestamp': ts,
         'arrival_time': arrival_time,
-        'gap': gap,
     })
     flush_reorder_buffer(device_id, st, current_ts=ts)
 
-    print(f"device={device_id} seq={seq} ts={ts} dup=False gap={gap} readings={len(readings)}") # for the demo , creates log for troubleshooting
+    # optional ACK (OFF by default)
+    if args.send_ack:
+        send_data_ack(sock, addr, device_id, seq)
 
-## run el server
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((args.host, args.port))
-print(f"Collector listening on {args.host}:{args.port}")  # simple status print
+    print(f"[DATA] device={device_id} seq={seq} ts={ts} dup=False queued=True readings={len(readings)}")
 
-while True:
-    data, addr = sock.recvfrom(4096)  # wait for any udp packet
+def handle_heartbeat(sock, addr, device_id, seq, ts):
+    arrival_time = int(now_rel_seconds())
+    st = devices.setdefault(device_id, {
+        'last_logged_seq': None,
+        'seen_seqs': set(),
+        'seen_queue': deque(),
+        'reorder_buffer': deque(),
+        'last_ts': None,
+        'dup_count': 0,
+        'gap_count': 0,
+        'last_seen': time.time()
+    })
 
-    
-    magic, version, msg_type, device_id, seq, ts = parse_header(data)
+    st['last_seen'] = time.time()
 
-    if magic != MAGIC:
-        print("Invalid magic from", addr)
-        continue
+    # duplicate detection (heartbeats can also duplicate)
+    if seq in st['seen_seqs']:
+        st['dup_count'] += 1
+        process_data_row(device_id, seq, ts, arrival_time, True, False)
+        print(f"[DUP-HB] device={device_id} seq={seq} ts={ts}")
+        if args.send_ack:
+            send_data_ack(sock, addr, device_id, seq)
+        return
 
-    payload = data[HEADER_SIZE:]  # the rest is the payload i need
+    st['seen_seqs'].add(seq)
+    st.setdefault('seen_queue', deque()).append(seq)
+    while len(st['seen_queue']) > args.seen_window:
+        old = st['seen_queue'].popleft()
+        st['seen_seqs'].discard(old)
 
-    if msg_type == MT_INIT:
-        handle_init(sock, addr, payload, device_id, seq, ts)
-    elif msg_type == MT_DATA:
-        handle_data(device_id, seq, ts, payload)
-    elif msg_type == MT_HEARTBEAT:
-        print(f"[HEARTBEAT] device={device_id} seq={seq} ts={ts}")
-        process_data(device_id, seq, ts, int(time.time() - RUN_START), False, False)
-        st = devices.setdefault(device_id, {
-            'last_seq': None,
-            'seen_seqs': set(),
-            'reorder_buffer': deque(),
-            'last_ts': None,
-            'dup_count': 0,
-            'gap_count': 0
-        })
-        flush_reorder_buffer(device_id, st, force=True, current_ts=ts)
-    else:
-        print("Unknown msg type", msg_type)
+    # buffer heartbeat and force-flush so ordering is by sensor timestamp
+    st['reorder_buffer'].append({
+        'seq': seq,
+        'timestamp': ts,
+        'arrival_time': arrival_time,
+    })
+    flush_reorder_buffer(device_id, st, force=True, current_ts=ts)
+    print(f"[HEARTBEAT] device={device_id} seq={seq} ts={ts}")
+
+def mark_offline_devices():
+    now_t = time.time()
+    for d, st in devices.items():
+        last = st.get('last_seen', 0)
+        if (now_t - last) > OFFLINE_TIMEOUT:
+            print(f"[OFFLINE] device={d} last_seen={(now_t - last):.1f}s ago")
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((args.host, args.port))
+    sock.settimeout(1.0)
+    print(f"Collector listening on {args.host}:{args.port} (csv={args.csv})")
+
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                mark_offline_devices()
+                continue
+            except Exception as e:
+                print("Recv error:", e)
+                continue
+
+            try:
+                magic, version, msg_type, device_id, seq, ts = parse_header(data)
+            except Exception as e:
+                print("Malformed packet from", addr, e)
+                continue
+
+            if magic != MAGIC:
+                print("Invalid magic from", addr)
+                continue
+
+            payload = data[HEADER_SIZE:]
+
+            if msg_type == MT_INIT:
+                handle_init(sock, addr, payload, device_id, seq, ts)
+            elif msg_type == MT_DATA:
+                handle_data(sock, addr, device_id, seq, ts, payload)
+            el
