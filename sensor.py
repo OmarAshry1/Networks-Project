@@ -5,162 +5,144 @@ import time
 import argparse
 import random
 
-# Protocol constants (must match collector)
+# =========================
+# Protocol constants
+# =========================
 MAGIC = 0x54
+VERSION = 1
+
 MT_INIT = 0x0
 MT_INIT_ACK = 0x1
 MT_DATA = 0x2
 MT_HEARTBEAT = 0x3
-MT_ACK = 0x4
+# MT_ACK exists but Phase2 typically does NOT use it
 
 HEADER_FMT = "!BBHII"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12
 
 MAX_PAYLOAD_BYTES = 200
 MAX_BODY_BYTES = MAX_PAYLOAD_BYTES - HEADER_SIZE
+READING_SIZE = 6  # sid(1) + fmt(1) + float32(4)
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--server-host", default="127.0.0.1")
-parser.add_argument("--server-port", type=int, default=9999)
-parser.add_argument("--device-id", type=int, default=100)
-parser.add_argument("--interval", type=float, default=1.0)
-parser.add_argument("--batch", type=int, default=1)
-parser.add_argument("--duration", type=int, default=60)
-parser.add_argument("--seed", type=int, default=None)
-parser.add_argument("--retries", type=int, default=3, help="retries for DATA in reliable mode")
-parser.add_argument("--ack-timeout", type=float, default=0.5, help="seconds to wait for ACK")
-parser.add_argument("--reliable", action="store_true", help="enable stop-and-wait reliable mode for DATA")
-parser.add_argument("--random-batch", action="store_true", help="randomize readings count (legacy/extra testing)")
-parser.add_argument("--fixed-readings", type=int, default=None, help="force exactly N readings per interval (Phase 2 friendly)")
-parser.add_argument("--heartbeat-every", type=int, default=0, help="send a heartbeat every N reports (0 disables)")
-parser.add_argument("--phase2", action="store_true", help="Phase 2 mode: deterministic DATA each interval, no reliability")
-args = parser.parse_args()
-
-# Phase 2 defaults: deterministic sending and no retransmissions
-if args.phase2:
-    args.random_batch = False
-    args.reliable = False
-    args.heartbeat_every = 0
-    if args.fixed_readings is None:
-        args.fixed_readings = max(1, args.batch)
-
-def build_header(msg_type, device_id, seq):
-    ver_type = (1 << 4) | (msg_type & 0x0F)
-    ts = int(time.time() - START_TIME)
+def pack_header(msg_type: int, device_id: int, seq: int, ts: int):
+    ver_type = ((VERSION & 0x0F) << 4) | (msg_type & 0x0F)
     return struct.pack(HEADER_FMT, MAGIC, ver_type, device_id & 0xFFFF, seq & 0xFFFFFFFF, ts & 0xFFFFFFFF)
 
-def build_init(device_id, seq):
-    return build_header(MT_INIT, device_id, seq)
+def build_init(device_id: int, seq: int, ts: int):
+    return pack_header(MT_INIT, device_id, seq, ts)
 
-def build_data(device_id, seq, readings):
-    h = build_header(MT_DATA, device_id, seq)
+def build_heartbeat(device_id: int, seq: int, ts: int):
+    return pack_header(MT_HEARTBEAT, device_id, seq, ts)
+
+def build_data(device_id: int, seq: int, ts: int, readings):
+    header = pack_header(MT_DATA, device_id, seq, ts)
     body = bytearray()
     for sid, val in readings:
         body.append(sid & 0xFF)
-        body.append(0x01)  # float32 format
+        body.append(0x01)  # float32
         body.extend(struct.pack("!f", float(val)))
-    return h + bytes(body)
+    return header + bytes(body)
 
-def build_heartbeat(device_id, seq):
-    return build_header(MT_HEARTBEAT, device_id, seq)
+def try_recv_init_ack(sock):
+    try:
+        sock.settimeout(1.0)
+        data, _ = sock.recvfrom(2048)
+        if len(data) < HEADER_SIZE:
+            return False
+        magic, ver_type, _, _, _ = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+        msg_type = ver_type & 0x0F
+        version = (ver_type >> 4) & 0x0F
+        return magic == MAGIC and version == VERSION and msg_type == MT_INIT_ACK
+    except socket.timeout:
+        return False
+    finally:
+        sock.settimeout(None)
 
-def parse_header_simple(packet):
-    if len(packet) < HEADER_SIZE:
-        return None
-    magic, ver_type, device_id, seq, ts = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
-    msg_type = ver_type & 0x0F
-    return magic, msg_type, device_id, seq, ts
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--server-host", default="127.0.0.1")
+    ap.add_argument("--server-port", type=int, default=9999)
+    ap.add_argument("--device-id", type=int, default=1)
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--duration", type=int, default=60)
 
-if args.seed is not None:
-    random.seed(args.seed)
-else:
-    random.seed(time.time())
+    # Phase2-friendly defaults: deterministic DATA, 1 reading per tick
+    ap.add_argument("--fixed-readings", type=int, default=1,
+                    help="Phase2: exactly N readings per interval (default=1).")
+    ap.add_argument("--randomize", action="store_true",
+                    help="Extra experiments: randomize readings count/value (NOT for Phase2 acceptance).")
+    ap.add_argument("--heartbeat-every", type=int, default=0,
+                    help="Send heartbeat every N reports (0 disables).")
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
 
-server = (args.server_host, args.server_port)
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(2.0)
+    if args.seed is not None:
+        random.seed(args.seed)
 
-START_TIME = time.time()
-seq = 0
+    server = (args.server_host, args.server_port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# INIT handshake (best-effort)
-init_pkt = build_init(args.device_id, seq)
-sock.sendto(init_pkt, server)
-print(f"Sent INIT seq={seq}")
-try:
-    data, addr = sock.recvfrom(2048)
-    hdr = parse_header_simple(data)
-    if hdr and hdr[0] == MAGIC and hdr[1] == MT_INIT_ACK:
-        print("Received INIT_ACK")
-except socket.timeout:
-    print("No INIT_ACK (continuing anyway)")
+    start_wall = time.time()
+    seq = 0
 
-start_time = time.time()
-last_send = 0
-send_index = 0
+    # Best-effort INIT handshake (Phase2 doesn’t rely on it, but it’s harmless)
+    init_pkt = build_init(args.device_id, seq, ts=0)
+    sock.sendto(init_pkt, server)
+    if args.verbose:
+        print(f"[INIT] sent device={args.device_id} seq={seq}")
+    got_ack = try_recv_init_ack(sock)
+    if args.verbose:
+        print("[INIT_ACK]" if got_ack else "[INIT_ACK] not received (continuing)")
 
-while time.time() - start_time < args.duration:
-    now = time.time()
-    if now - last_send >= args.interval:
+    last_send = start_wall
+    report_index = 0
+
+    while (time.time() - start_wall) < args.duration:
+        now = time.time()
+        if (now - last_send) < args.interval:
+            time.sleep(0.001)
+            continue
+
+        report_index += 1
         seq = (seq + 1) & 0xFFFFFFFF
-        send_index += 1
+        ts = int(now - start_wall)  # sender timestamp (seconds since sensor start)
 
-        # Phase-2 friendly: deterministic by default (1..batch readings each interval)
-        if args.fixed_readings is not None:
-            count = max(1, int(args.fixed_readings))
-        elif args.random_batch:
-            count = random.randint(0, max(1, args.batch))
-        else:
-            count = max(1, args.batch)
+        # heartbeat schedule (optional)
+        force_hb = (args.heartbeat_every > 0 and (report_index % args.heartbeat_every) == 0)
 
-        force_hb = (args.heartbeat_every > 0 and (send_index % args.heartbeat_every) == 0)
-        readings = []
-        body_bytes = 0
-        for _ in range(count):
-            sid = 1
-            val = random.uniform(0.0, 100.0)
-            reading_size = 6
-            if body_bytes + reading_size > MAX_BODY_BYTES:
-                break
-            readings.append((sid, val))
-            body_bytes += reading_size
-
-        if (not force_hb) and count > 0:
-            pkt = build_data(args.device_id, seq, readings)
-            if args.reliable:
-                # stop-and-wait: optional/experimental (OFF by default)
-                tries = 1
-                acked = False
-                while tries <= args.retries and not acked:
-                    sock.sendto(pkt, server)
-                    print(f"Sent DATA seq={seq} readings={len(readings)} (try {tries})")
-                    sock.settimeout(args.ack_timeout)
-                    try:
-                        ack_pkt, _ = sock.recvfrom(2048)
-                        hdr = parse_header_simple(ack_pkt)
-                        if hdr and hdr[0] == MAGIC and hdr[1] == MT_ACK:
-                            _, _, _, ack_seq, _ = hdr
-                            if ack_seq == seq:
-                                acked = True
-                                print(f"Received ACK for seq={seq}")
-                                break
-                    except socket.timeout:
-                        print(f"ACK timeout for seq={seq} (try {tries}/{args.retries})")
-                    finally:
-                        sock.settimeout(2.0)
-                    tries += 1
-                if not acked:
-                    print(f"Gave up on seq={seq} after {tries-1} retries")
-            else:
-                sock.sendto(pkt, server)
-                print(f"Sent DATA seq={seq} readings={len(readings)}")
-        else:
-            # heartbeat (explicit or when count==0 in random mode)
-            pkt = build_heartbeat(args.device_id, seq)
+        if force_hb:
+            pkt = build_heartbeat(args.device_id, seq, ts)
             sock.sendto(pkt, server)
-            print(f"Sent HEARTBEAT seq={seq}")
+            if args.verbose:
+                print(f"[HB] sent device={args.device_id} seq={seq} ts={ts}")
+        else:
+            # determine number of readings
+            if args.randomize:
+                count = random.randint(1, max(1, args.fixed_readings))
+            else:
+                count = max(1, args.fixed_readings)
+
+            # enforce payload size
+            max_readings = MAX_BODY_BYTES // READING_SIZE
+            count = min(count, max_readings)
+
+            readings = []
+            for _ in range(count):
+                sid = 1
+                val = random.uniform(0, 100) if args.randomize else 42.0
+                readings.append((sid, val))
+
+            pkt = build_data(args.device_id, seq, ts, readings)
+            sock.sendto(pkt, server)
+            if args.verbose:
+                print(f"[DATA] sent device={args.device_id} seq={seq} ts={ts} readings={len(readings)}")
 
         last_send = now
 
-sock.close()
-print("Sensor finished.")
+    sock.close()
+    if args.verbose:
+        print("Sensor finished.")
+
+if __name__ == "__main__":
+    main()
