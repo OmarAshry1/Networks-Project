@@ -39,6 +39,7 @@ REORDER_BUFFER_MAX = 64      # keep bounded
 SEEN_WINDOW = 10000          # dedup window size
 OFFLINE_TIMEOUT_SEC = 5      # offline detection
 
+
 def pack_header(msg_type: int, device_id: int, seq: int, ts: int):
     ver_type = ((VERSION & 0x0F) << 4) | (msg_type & 0x0F)
     return struct.pack(
@@ -50,6 +51,7 @@ def pack_header(msg_type: int, device_id: int, seq: int, ts: int):
         ts & 0xFFFFFFFF
     )
 
+
 def ensure_csv_header(path: str):
     exists = os.path.exists(path)
     if not exists:
@@ -57,6 +59,7 @@ def ensure_csv_header(path: str):
         with open(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             w.writeheader()
+
 
 def write_row(writer, fhandle, device_id, seq, ts, arrival_time, dup, gap):
     writer.writerow({
@@ -68,6 +71,7 @@ def write_row(writer, fhandle, device_id, seq, ts, arrival_time, dup, gap):
         "gap_flag": 1 if gap else 0,
     })
     fhandle.flush()  # force to disk
+
 
 class DeviceState:
     def __init__(self):
@@ -88,6 +92,7 @@ class DeviceState:
             old = self.seen_queue.popleft()
             if old in self.seen_set:
                 self.seen_set.remove(old)
+
 
 def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force=False):
     """
@@ -132,17 +137,20 @@ def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force
             dup=False, gap=gap
         )
 
+
 def mark_offline(devices: dict):
     now = time.time()
     for dev_id, st in devices.items():
         if (now - st.last_seen_wall) > OFFLINE_TIMEOUT_SEC:
             print(f"[OFFLINE] device={dev_id} last_seen={(now - st.last_seen_wall):.1f}s ago")
 
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bind-host", default="0.0.0.0")
-    ap.add_argument("--bind-port", type=int, default=9999)
-    ap.add_argument("--csv-out", default="telemetry_log.csv")
+    # aliases so both styles work (your scripts use --host/--port/--csv)
+    ap.add_argument("--bind-host", "--host", dest="bind_host", default="0.0.0.0")
+    ap.add_argument("--bind-port", "--port", dest="bind_port", type=int, default=9999)
+    ap.add_argument("--csv-out", "--csv", dest="csv_out", default="telemetry_log.csv")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--send-ack", action="store_true", help="Send MT_ACK for DATA/HB (debug only).")
     args = ap.parse_args()
@@ -182,13 +190,16 @@ def main():
 
             # INIT handshake
             if msg_type == MT_INIT:
+                # Per RFC: INIT resets/creates per-device state to avoid false DUP/GAP across restarts.
+                st = DeviceState()
+                devices[device_id] = st
+                st.last_seen_wall = time.time()
+
                 # Payload (optional): ASCII capability string
                 cap_bytes = data[HEADER_SIZE:]
                 if cap_bytes:
-                    try:
-                        st.capabilities = cap_bytes.decode("ascii", errors="replace")
-                    except Exception:
-                        st.capabilities = None
+                    st.capabilities = cap_bytes.decode("ascii", errors="replace")
+
                 if args.verbose:
                     cap_preview = (st.capabilities[:80] + "…") if (st.capabilities and len(st.capabilities) > 80) else st.capabilities
                     print(f"[INIT] device={device_id} seq={seq} ts={ts} from={addr} caps={cap_preview}")
@@ -253,7 +264,7 @@ def main():
             mark_offline(devices)
 
     except KeyboardInterrupt:
-        print("\nShutting down... flushing buffers")
+        print("\nShutting down. flushing buffers")
         for _, st in devices.items():
             flush_reorder(st, writer, f, current_ts=10**9, force=True)
         print("Done.")
@@ -261,12 +272,13 @@ def main():
         try:
             f.flush()
             f.close()
-        except:
+        except Exception:
             pass
         try:
             sock.close()
-        except:
+        except Exception:
             pass
+
 
 if __name__ == "__main__":
     main()
