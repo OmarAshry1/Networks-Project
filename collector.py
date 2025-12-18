@@ -7,17 +7,15 @@ import os
 import csv
 from collections import deque
 
-# =========================
 # Protocol constants
-# =========================
-MAGIC = 0x54  # 'T' / TinyTelemetry
+MAGIC = 0x54  
 VERSION = 1
 
 MT_INIT = 0x0
 MT_INIT_ACK = 0x1
 MT_DATA = 0x2
 MT_HEARTBEAT = 0x3
-MT_ACK = 0x4  # debug-only; OFF by default
+MT_ACK = 0x4 
 
 HEADER_FMT = "!BBHII"  # magic(1), ver_type(1), device_id(2), seq(4), ts(4)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12 bytes
@@ -31,9 +29,7 @@ CSV_FIELDS = [
     "gap_flag",
 ]
 
-# =========================
-# Collector tuning knobs
-# =========================
+
 REORDER_WINDOW_SEC = 1       # hold packets for up to 1s based on sender timestamp
 REORDER_BUFFER_MAX = 64      # keep bounded
 SEEN_WINDOW = 10000          # dedup window size
@@ -65,23 +61,23 @@ def write_row(writer, fhandle, device_id, seq, ts, arrival_time, dup, gap):
     writer.writerow({
         "device_id": device_id,
         "seq": seq,
-        "timestamp": ts,                 # sender timestamp
-        "arrival_time": arrival_time,    # server arrival time (relative seconds)
+        "timestamp": ts,                
+        "arrival_time": arrival_time,   
         "duplicate_flag": 1 if dup else 0,
         "gap_flag": 1 if gap else 0,
     })
-    fhandle.flush()  # force to disk
+    fhandle.flush()  
 
 
 class DeviceState:
     def __init__(self):
-        # reorder buffer entries: dict(device_id, seq, ts, arrival_time)
+  
         self.reorder = []
-        self.last_logged_seq = None  # last seq written to CSV AFTER reorder
+        self.last_logged_seq = None  
         self.seen_set = set()
         self.seen_queue = deque()
         self.last_seen_wall = time.time()
-        self.capabilities = None  # capability string from INIT (ASCII)
+        self.capabilities = None  
         self.dup_count = 0
         self.gap_count = 0
 
@@ -102,7 +98,7 @@ def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force
     if not state.reorder:
         return
 
-    # Sort by sender ts then seq for stability
+ 
     state.reorder.sort(key=lambda e: (e["ts"], e["seq"]))
 
     idx = 0
@@ -147,7 +143,7 @@ def mark_offline(devices: dict):
 
 def main():
     ap = argparse.ArgumentParser()
-    # aliases so both styles work (your scripts use --host/--port/--csv)
+ 
     ap.add_argument("--bind-host", "--host", dest="bind_host", default="0.0.0.0")
     ap.add_argument("--bind-port", "--port", dest="bind_port", type=int, default=9999)
     ap.add_argument("--csv-out", "--csv", dest="csv_out", default="telemetry_log.csv")
@@ -180,7 +176,7 @@ def main():
             if magic != MAGIC or version != VERSION:
                 continue
 
-            arrival_time = round(time.time() - start_wall, 6)  # relative seconds
+            arrival_time = round(time.time() - start_wall, 6)  
 
             st = devices.get(device_id)
             if st is None:
@@ -188,14 +184,14 @@ def main():
                 devices[device_id] = st
             st.last_seen_wall = time.time()
 
-            # INIT handshake
+         
             if msg_type == MT_INIT:
-                # Per RFC: INIT resets/creates per-device state to avoid false DUP/GAP across restarts.
+        
                 st = DeviceState()
                 devices[device_id] = st
                 st.last_seen_wall = time.time()
 
-                # Payload (optional): ASCII capability string
+              
                 cap_bytes = data[HEADER_SIZE:]
                 if cap_bytes:
                     st.capabilities = cap_bytes.decode("ascii", errors="replace")
@@ -204,18 +200,18 @@ def main():
                     cap_preview = (st.capabilities[:80] + "…") if (st.capabilities and len(st.capabilities) > 80) else st.capabilities
                     print(f"[INIT] device={device_id} seq={seq} ts={ts} from={addr} caps={cap_preview}")
 
-                # INIT_ACK should carry a fresh collector timestamp (seconds since collector start)
+               
                 fresh_ts = int(time.time() - start_wall)
                 init_ack = pack_header(MT_INIT_ACK, device_id, seq, fresh_ts)
                 sock.sendto(init_ack, addr)
                 continue
 
-            # ACK support (debug only)
+           
             if args.send_ack and msg_type in (MT_DATA, MT_HEARTBEAT):
                 ack = pack_header(MT_ACK, device_id, seq, ts)
                 sock.sendto(ack, addr)
 
-            # Duplicate detection (log immediately)
+         
             if seq in st.seen_set:
                 st.dup_count += 1
                 write_row(writer, f, device_id, seq, ts, arrival_time, dup=True, gap=False)
@@ -225,9 +221,9 @@ def main():
 
             st.seen_add(seq)
 
-            # DATA/HEARTBEAT go through reorder buffer
+         
             if msg_type == MT_DATA:
-                # Minimal payload validation (reading blocks are 6 bytes each per RFC)
+             
                 payload_len = len(data) - HEADER_SIZE
                 if payload_len < 0:
                     payload_len = 0
@@ -251,7 +247,6 @@ def main():
                     "ts": ts,
                     "arrival_time": arrival_time
                 })
-                # heartbeats can force flush to keep logs moving
                 flush_reorder(st, writer, f, current_ts=ts, force=True)
                 if args.verbose:
                     print(f"[HB] device={device_id} seq={seq} ts={ts}")
@@ -260,7 +255,6 @@ def main():
                 if args.verbose:
                     print(f"[INFO] ignored msg_type={msg_type} device={device_id} seq={seq}")
 
-            # optional offline print (lightweight)
             mark_offline(devices)
 
     except KeyboardInterrupt:

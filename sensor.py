@@ -5,9 +5,7 @@ import time
 import argparse
 import random
 
-# =========================
-# Protocol constants
-# =========================
+
 MAGIC = 0x54
 VERSION = 1
 
@@ -15,16 +13,15 @@ MT_INIT = 0x0
 MT_INIT_ACK = 0x1
 MT_DATA = 0x2
 MT_HEARTBEAT = 0x3
-# MT_ACK exists but Phase2 typically does NOT use it
+
 
 HEADER_FMT = "!BBHII"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12
 
 MAX_PAYLOAD_BYTES = 200
 MAX_BODY_BYTES = MAX_PAYLOAD_BYTES - HEADER_SIZE
-READING_SIZE = 6  # sid(1) + fmt(1) + float32(4)
+READING_SIZE = 6  
 
-# Capability string sent in INIT (ASCII). Keep it short & parseable.
 CAPABILITIES = (
     f"fmt=float32;reading_size={READING_SIZE};max_payload={MAX_PAYLOAD_BYTES};"
     f"max_readings={(MAX_BODY_BYTES // READING_SIZE)}"
@@ -42,9 +39,9 @@ def pack_header(msg_type: int, device_id: int, seq: int, ts: int):
     )
 
 def build_init(device_id: int, seq: int, ts: int, capabilities: str = CAPABILITIES):
-    # INIT carries an ASCII capability string (per RFC). Collector may ignore it, but it should be present.
+  
     cap_bytes = (capabilities or "").encode("ascii", errors="replace")
-    # keep within Phase2 payload limit
+   
     if len(cap_bytes) > MAX_BODY_BYTES:
         cap_bytes = cap_bytes[:MAX_BODY_BYTES]
     return pack_header(MT_INIT, device_id, seq, ts) + cap_bytes
@@ -57,7 +54,7 @@ def build_data(device_id: int, seq: int, ts: int, readings):
     body = bytearray()
     for sid, val in readings:
         body.append(sid & 0xFF)
-        body.append(0x01)  # float32
+        body.append(0x01)  
         body.extend(struct.pack("!f", float(val)))
     return header + bytes(body)
 
@@ -84,12 +81,12 @@ def main():
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--duration", type=int, default=60)
 
-    # Phase2-friendly defaults: deterministic DATA, 1 reading per tick
+  
     ap.add_argument(
         "--fixed-readings", type=int, default=1,
         help="Phase2: exactly N readings per interval (default=1). Use 0 to simulate no data (heartbeats only)."
     )
-    # Backward-compatible alias used by our test scripts
+    
     ap.add_argument(
         "--batch", type=int, dest="fixed_readings",
         help="Alias for --fixed-readings (used by some test runners)."
@@ -116,7 +113,7 @@ def main():
     start_wall = time.time()
     seq = 0
 
-    # Best-effort INIT handshake (Phase2 doesn’t rely on it, but it’s harmless)
+  
     init_pkt = build_init(args.device_id,
                          seq, ts=0, capabilities=CAPABILITIES)
     sock.sendto(init_pkt, server)
@@ -137,10 +134,8 @@ def main():
 
         report_index += 1
         seq = (seq + 1) & 0xFFFFFFFF
-        ts = int(now - start_wall)  # sender timestamp (seconds since sensor start)
+        ts = int(now - start_wall)  
 
-        # Decide whether this tick has DATA available.
-        # RFC intent: HEARTBEAT is sent when no new DATA is available.
         no_data_mode = (args.fixed_readings is not None and args.fixed_readings <= 0)
         hb_instead_of_data = (args.heartbeat_every > 0 and (report_index % args.heartbeat_every) == 0)
 
@@ -151,13 +146,13 @@ def main():
                 reason = "no-data" if no_data_mode else f"every-{args.heartbeat_every}"
                 print(f"[HB] sent device={args.device_id} seq={seq} ts={ts} reason={reason}")
         else:
-            # determine number of readings
+           
             if args.randomize:
                 count = random.randint(1, max(1, int(args.fixed_readings)))
             else:
                 count = max(1, int(args.fixed_readings))
 
-            # enforce payload size
+           
             max_readings = MAX_BODY_BYTES // READING_SIZE
             count = min(count, max_readings)
 
@@ -167,7 +162,7 @@ def main():
                 if args.randomize:
                     val = random.uniform(0, 100)
                 else:
-                    # deterministic value pattern helps Phase2 testing
+               
                     val = float((sid * 1.0) + (seq % 10) * 0.1)
                 readings.append((sid, val))
 
