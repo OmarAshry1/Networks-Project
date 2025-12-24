@@ -123,13 +123,53 @@ def main():
     if args.verbose:
         print("[INIT_ACK]" if got_ack else "[INIT_ACK] not received (continuing)")
 
-    last_send = start_wall
-    report_index = 0
 
-    while (time.time() - start_wall) < args.duration:
+    report_index = 0
+    last_send = start_wall
+    
+    # Send first DATA packet immediately (at t=0 or very soon after)
+    seq = (seq + 1) & 0xFFFFFFFF
+    ts = int(time.time() - start_wall)
+    now = time.time()
+    
+    no_data_mode = (args.fixed_readings is not None and args.fixed_readings <= 0)
+    hb_instead_of_data = False  
+    
+    if not no_data_mode:
+
+        if args.randomize:
+            count = random.randint(1, max(1, int(args.fixed_readings)))
+        else:
+            count = max(1, int(args.fixed_readings))
+        
+        max_readings = MAX_BODY_BYTES // READING_SIZE
+        count = min(count, max_readings)
+        
+        readings = []
+        for i in range(count):
+            sid = (i % 255) + 1
+            if args.randomize:
+                val = random.uniform(0, 100)
+            else:
+                val = float((sid * 1.0) + (seq % 10) * 0.1)
+            readings.append((sid, val))
+        
+        pkt = build_data(args.device_id, seq, ts, readings)
+        sock.sendto(pkt, server)
+        if args.verbose:
+            print(f"[DATA] sent device={args.device_id} seq={seq} ts={ts} readings={len(readings)} (first packet)")
+        
+        last_send = now
+        report_index = 1
+
+
+    while (time.time() - start_wall) < (args.duration - 0.05):
         now = time.time()
         if (now - last_send) < args.interval:
-            time.sleep(0.001)
+            # Sleep for remaining time, but use adaptive sleep
+            sleep_time = min(args.interval - (now - last_send), 0.01)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
             continue
 
         report_index += 1

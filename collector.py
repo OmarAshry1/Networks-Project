@@ -80,6 +80,7 @@ class DeviceState:
         self.capabilities = None  
         self.dup_count = 0
         self.gap_count = 0
+        self.logged_seqs = set()  
 
     def seen_add(self, seq: int):
         self.seen_set.add(seq)
@@ -90,7 +91,7 @@ class DeviceState:
                 self.seen_set.remove(old)
 
 
-def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force=False):
+def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force=False, wall_time=None):
     """
     Flush reorder buffer IN SENDER TIMESTAMP ORDER.
     Gap detection happens here (after reorder), not on arrival.
@@ -101,13 +102,29 @@ def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force
  
     state.reorder.sort(key=lambda e: (e["ts"], e["seq"]))
 
+    # Track if this is the first packet ever (before we start flushing)
+    is_first_packet = (state.last_logged_seq is None)
+
     idx = 0
     while idx < len(state.reorder):
         entry = state.reorder[idx]
 
         can_flush = force
+        
+
+        if not can_flush and is_first_packet and idx == 0:
+            can_flush = True
+        
+
+        if not can_flush and wall_time is not None and "arrival_time" in entry:
+            time_since_arrival = wall_time - entry["arrival_time"]
+            if time_since_arrival >= REORDER_WINDOW_SEC:
+                can_flush = True
+        
+        # Legacy check: if current_ts (sender timestamp) indicates enough time passed
         if not can_flush and current_ts is not None:
-            if (current_ts - entry["ts"]) >= REORDER_WINDOW_SEC:
+
+            if current_ts > entry["ts"] and (current_ts - entry["ts"]) >= REORDER_WINDOW_SEC:
                 can_flush = True
 
         if not can_flush and len(state.reorder) > REORDER_BUFFER_MAX:
@@ -118,6 +135,8 @@ def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force
 
         entry = state.reorder.pop(idx)
 
+        if entry["seq"] in state.logged_seqs:
+            continue  
         gap = False
         if state.last_logged_seq is not None:
             expected = (state.last_logged_seq + 1) & 0xFFFFFFFF
@@ -126,6 +145,7 @@ def flush_reorder(state: DeviceState, writer, fhandle, *, current_ts=None, force
                 state.gap_count += 1
 
         state.last_logged_seq = entry["seq"]
+        state.logged_seqs.add(entry["seq"])
 
         write_row(
             writer, fhandle,
@@ -236,7 +256,7 @@ def main():
                     "ts": ts,
                     "arrival_time": arrival_time
                 })
-                flush_reorder(st, writer, f, current_ts=ts, force=False)
+                flush_reorder(st, writer, f, current_ts=ts, force=False, wall_time=arrival_time)
                 if args.verbose:
                     print(f"[DATA] device={device_id} seq={seq} ts={ts} buf={len(st.reorder)}")
 
@@ -247,7 +267,7 @@ def main():
                     "ts": ts,
                     "arrival_time": arrival_time
                 })
-                flush_reorder(st, writer, f, current_ts=ts, force=True)
+                flush_reorder(st, writer, f, current_ts=ts, force=True, wall_time=arrival_time)
                 if args.verbose:
                     print(f"[HB] device={device_id} seq={seq} ts={ts}")
 
@@ -259,8 +279,9 @@ def main():
 
     except KeyboardInterrupt:
         print("\nShutting down. flushing buffers")
+        final_wall_time = time.time() - start_wall
         for _, st in devices.items():
-            flush_reorder(st, writer, f, current_ts=10**9, force=True)
+            flush_reorder(st, writer, f, current_ts=10**9, force=True, wall_time=final_wall_time)
         print("Done.")
     finally:
         try:

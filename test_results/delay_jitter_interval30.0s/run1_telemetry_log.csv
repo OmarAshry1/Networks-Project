@@ -1,0 +1,2 @@
+device_id,seq,timestamp,arrival_time,duplicate_flag,gap_flag
+100,1,0,4.32031,0,0
