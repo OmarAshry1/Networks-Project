@@ -16,16 +16,16 @@ import psutil
 PROJECT_ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 
-# Test configuration
-PORT = 9999
-DURATION = 60  # seconds per test
-DEVICE_ID = 100
-NUM_RUNS = 5  # Repeat each test 5 times
 
-# Reporting intervals to test (1s, 5s, 30s)
+PORT = 9999
+DURATION = 60  
+DEVICE_ID = 100
+NUM_RUNS = 5  
+
+
 REPORTING_INTERVALS = [1.0, 5.0, 30.0]
 
-# Test scenarios with netem commands
+
 SCENARIOS = {
     "baseline": {
         "name": "Baseline (no impairment)",
@@ -150,8 +150,7 @@ def analyze_csv(csv_path):
         if metrics["packets_received"] > 0:
             metrics["duplicate_rate"] = metrics["duplicate_count"] / metrics["packets_received"]
         
-        # Estimate bytes per report (header 12 bytes + payload estimate)
-        # Assuming average payload of ~6 bytes per reading
+
         metrics["bytes_per_report"] = 12 + 6  # Header + average reading
         
     except Exception as e:
@@ -169,47 +168,47 @@ def run_single_test(scenario_key, scenario, interval, run_num):
     print(f"  Test: {scenario_name} | Interval: {interval}s | Run: {run_num}/{NUM_RUNS}")
     print(f"  {'='*60}")
     
-    # Create results directory
+
     results_dir = PROJECT_ROOT / "test_results" / f"{scenario_key}_interval{interval}s"
     results_dir.mkdir(parents=True, exist_ok=True)
     
     csv_path = results_dir / f"run{run_num}_telemetry_log.csv"
     pcap_path = results_dir / f"run{run_num}_trace.pcap"
     
-    # Clear any existing netem rules
+
     clear_netem()
     
-    # Apply network impairment if needed
+
     if netem_cmd:
         apply_netem(netem_cmd)
     
-    # Start packet capture
+
     print("  Starting packet capture...")
     tcpdump_proc = start_pcap_capture(pcap_path)
     
-    # Start collector
+
     print("  Starting collector...")
     collector_proc = start_collector(csv_path)
     
-    # Wait a moment for collector to be ready (increased to ensure it's fully ready)
+
     time.sleep(2)
     
-    # Start sensor
+
     seed = int(time.time()) + run_num
     print(f"  Starting sensor (seed={seed}, interval={interval}s, duration={DURATION}s)...")
     sensor_proc = start_sensor(interval, DURATION, seed=seed)
     
-    # Monitor CPU usage during test
+
     collector_pid = collector_proc.pid
     cpu_samples = []
     start_time = time.time()
     
     try:
-        # Wait for sensor to complete
+
         sensor_proc.wait()
         sensor_duration = time.time() - start_time
         
-        # Sample CPU during execution
+
         try:
             proc = psutil.Process(collector_pid)
             cpu_samples = [proc.cpu_percent(interval=0.1) for _ in range(10)]
@@ -220,7 +219,7 @@ def run_single_test(scenario_key, scenario, interval, run_num):
         print("\n  Test interrupted!")
         sensor_proc.terminate()
     
-    # Stop processes
+
     print("  Stopping processes...")
     tcpdump_proc.terminate()
     collector_proc.terminate()
@@ -232,10 +231,10 @@ def run_single_test(scenario_key, scenario, interval, run_num):
         tcpdump_proc.kill()
         collector_proc.kill()
     
-    # Clear netem
+
     clear_netem()
     
-    # Analyze results
+
     print("  Analyzing results...")
     metrics = analyze_csv(csv_path)
     
@@ -290,14 +289,14 @@ def run_all_scenarios():
             
             all_results[scenario_key] = scenario_results
         
-        # Generate summary report
+
         print("\n\n" + "="*70)
         print("TEST SUMMARY")
         print("="*70)
         generate_summary_report(all_results)
         
     finally:
-        # Ensure netem is cleared
+
         clear_netem()
         print("\n\nAll tests completed!")
         print(f"Results saved in: {PROJECT_ROOT / 'test_results'}")

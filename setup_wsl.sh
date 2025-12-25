@@ -23,13 +23,13 @@ sudo apt-get install -y tcpdump iproute2
 echo "[4/6] Installing Python dependencies..."
 # Use --break-system-packages flag for Ubuntu's externally-managed environment
 # This is safe for development/testing purposes
-echo "  Installing psutil (this may require --break-system-packages flag)..."
-pip3 install --user --break-system-packages psutil || {
+echo "  Installing psutil, matplotlib, numpy (this may require --break-system-packages flag)..."
+pip3 install --user --break-system-packages psutil matplotlib numpy || {
     echo "  Warning: pip install failed. Trying alternative method..."
     # Alternative: install via apt if available
-    sudo apt-get install -y python3-psutil 2>/dev/null || {
-        echo "  Error: Could not install psutil. You may need to install it manually."
-        echo "  Try: pip3 install --user --break-system-packages psutil"
+    sudo apt-get install -y python3-psutil python3-matplotlib python3-numpy 2>/dev/null || {
+        echo "  Error: Could not install dependencies. You may need to install them manually."
+        echo "  Try: pip3 install --user --break-system-packages psutil matplotlib numpy"
     }
 }
 
